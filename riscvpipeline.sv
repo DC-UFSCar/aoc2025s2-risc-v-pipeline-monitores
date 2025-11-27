@@ -46,6 +46,9 @@ module riscvpipeline (
    function readsRs1; input [31:0] I; readsRs1 = !(isJAL(I) || isAUIPC(I) || isLUI(I)); endfunction
    function readsRs2; input [31:0] I; readsRs2 = isALUreg(I) || isBranch(I) || isStore(I); endfunction
 
+   logic stall;
+   logic flush;
+
 /**********************  F: Instruction fetch *********************************/
    localparam NOP = 32'b0000000_00000_00000_000_00000_0110011;
    reg [31:0] F_PC;
@@ -57,16 +60,31 @@ module riscvpipeline (
    /** These two signals come from the Execute stage **/
    wire [31:0] jumpOrBranchAddress;
    wire        jumpOrBranch;
+   assign flush = jumpOrBranch;
 
    always @(posedge clk) begin
-      FD_instr <= Instr;
-      FD_PC    <= F_PC;
-      F_PC     <= F_PC + 4;
-      if (jumpOrBranch)
-    	   F_PC     <= jumpOrBranchAddress;
-      FD_nop <= reset;
-      if (reset)
-    	   F_PC <= 0;
+      if (reset) begin
+           F_PC <= 0;
+           FD_nop <= 1;
+      end else begin
+           if (!stall) begin
+               if (jumpOrBranch)
+                    F_PC <= jumpOrBranchAddress;
+               else
+                    F_PC <= F_PC + 4;
+           end
+
+           if (!stall) begin
+               if (flush) begin
+                   FD_instr <= NOP;
+                   FD_nop   <= 1;
+               end else begin
+                   FD_instr <= Instr;
+                   FD_nop   <= 0;
+               end
+               FD_PC    <= F_PC;
+           end
+      end
    end
 
 /************************ D: Instruction decode *******************************/
@@ -81,13 +99,50 @@ module riscvpipeline (
    wire [4:0]  wbRdId;
 
    reg [31:0] RegisterBank [0:31];
+   
+   wire [4:0]  id_rs1 = rs1Id(FD_instr);
+   wire [4:0]  id_rs2 = rs2Id(FD_instr);
+
+   always_comb begin
+       stall = 0;
+       if (isLoad(DE_instr)) begin
+           if ((rs1Id(FD_instr) == rdId(DE_instr) && readsRs1(FD_instr)) || 
+               (rs2Id(FD_instr) == rdId(DE_instr) && readsRs2(FD_instr))) begin
+               stall = 1;
+           end
+       end
+   end
+
    always @(posedge clk) begin
-      DE_PC    <= FD_PC;
-      DE_instr <= FD_nop ? NOP : FD_instr;
-      DE_rs1 <= rs1Id(FD_instr) ? RegisterBank[rs1Id(FD_instr)] : 32'b0;
-      DE_rs2 <= rs2Id(FD_instr) ? RegisterBank[rs2Id(FD_instr)] : 32'b0;
-      if (writeBackEn)
-	      RegisterBank[wbRdId] <= writeBackData;
+      if (reset || flush) begin 
+          DE_instr <= NOP;
+          DE_PC    <= 0;
+          DE_rs1   <= 0;
+          DE_rs2   <= 0;
+      end else if (stall) begin
+
+          DE_instr <= NOP;
+          DE_PC    <= 0;
+          DE_rs1   <= 0;
+          DE_rs2   <= 0;
+
+      end else begin
+          DE_PC    <= FD_PC;
+          DE_instr <= FD_nop ? NOP : FD_instr;
+
+          if (writeBackEn && (rs1Id(FD_instr) == wbRdId) && wbRdId != 0)
+              DE_rs1 <= writeBackData;
+          else
+              DE_rs1 <= rs1Id(FD_instr) ? RegisterBank[rs1Id(FD_instr)] : 32'b0;
+              
+          if (writeBackEn && (rs2Id(FD_instr) == wbRdId) && wbRdId != 0)
+              DE_rs2 <= writeBackData;
+          else
+              DE_rs2 <= rs2Id(FD_instr) ? RegisterBank[rs2Id(FD_instr)] : 32'b0;
+              
+          if (writeBackEn && wbRdId != 0)
+              RegisterBank[wbRdId] <= writeBackData;
+      end
    end
 
 /************************ E: Execute *****************************************/
@@ -96,9 +151,49 @@ module riscvpipeline (
    reg [31:0] EM_rs2;
    reg [31:0] EM_Eresult;
    reg [31:0] EM_addr;
-   wire [31:0] E_aluIn1 = DE_rs1;
-   wire [31:0] E_aluIn2 = isALUreg(DE_instr) | isBranch(DE_instr) ? DE_rs2 : Iimm(DE_instr);
-   wire [4:0]  E_shamt  = isALUreg(DE_instr) ? DE_rs2[4:0] : shamt(DE_instr);
+   
+   logic [1:0] forwardA;
+   logic [1:0] forwardB;
+
+   wire [4:0] rs1E = rs1Id(DE_instr);
+   wire [4:0] rs2E = rs2Id(DE_instr);
+   wire [4:0] rdM  = rdId(EM_instr); 
+   wire [4:0] rdW  = rdId(MW_instr);
+   
+   wire regWriteM = writesRd(EM_instr); 
+   wire regWriteW = writesRd(MW_instr);
+
+   always_comb begin
+       forwardA = 2'b00;
+       forwardB = 2'b00; 
+
+       if (regWriteM && (rdM != 0) && (rdM == rs1E)) begin
+           forwardA = 2'b10;
+       end else if (regWriteW && (rdW != 0) && (rdW == rs1E)) begin
+           forwardA = 2'b01; 
+       end
+
+       if (regWriteM && (rdM != 0) && (rdM == rs2E)) begin
+           forwardB = 2'b10; 
+       end else if (regWriteW && (rdW != 0) && (rdW == rs2E)) begin
+           forwardB = 2'b01; 
+       end
+   end
+
+   wire [31:0] forward_aluIn1 = (forwardA == 2'b10) ? EM_Eresult :
+                                (forwardA == 2'b01) ? writeBackData :
+                                DE_rs1;
+                                
+   wire [31:0] forward_aluIn2 = (forwardB == 2'b10) ? EM_Eresult :
+                                (forwardB == 2'b01) ? writeBackData :
+                                DE_rs2;
+
+   wire [31:0] E_aluIn1 = forward_aluIn1;
+   wire [31:0] E_aluIn2 = isALUreg(DE_instr) | isBranch(DE_instr) ? forward_aluIn2 : Iimm(DE_instr);
+   
+   wire [31:0] E_storeData = forward_aluIn2;
+
+   wire [4:0]  E_shamt  = isALUreg(DE_instr) ? forward_aluIn2[4:0] : shamt(DE_instr);
    wire E_minus = DE_instr[30] & isALUreg(DE_instr);
    wire E_arith_shift = DE_instr[30];
 
@@ -172,12 +267,20 @@ module riscvpipeline (
                                           E_aluOut               ;
 
    always @(posedge clk) begin
-      EM_PC      <= DE_PC;
-      EM_instr   <= DE_instr;
-      EM_rs2     <= DE_rs2;
-      EM_Eresult <= E_result;
-      EM_addr    <= isStore(DE_instr) ? DE_rs1 + Simm(DE_instr) :
-                                        DE_rs1 + Iimm(DE_instr) ;
+      if (reset || flush) begin
+          EM_PC      <= 0;
+          EM_instr   <= NOP;
+          EM_rs2     <= 0;
+          EM_Eresult <= 0;
+          EM_addr    <= 0;
+      end else begin
+          EM_PC      <= DE_PC;
+          EM_instr   <= DE_instr;
+          EM_rs2     <= E_storeData;
+          EM_Eresult <= E_result;
+          EM_addr    <= isStore(DE_instr) ? E_aluIn1 + Simm(DE_instr) :
+                                            E_aluIn1 + Iimm(DE_instr) ;
+      end
    end
 
 /************************ M: Memory *******************************************/
